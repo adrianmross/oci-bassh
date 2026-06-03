@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Let `ensure` and `ensure-target` accept the advertised root `--wait-timeout`
+  flag before or after the subcommand and pass it through to
+  `bastion-session ensure`.
+- Add `hop setup shell` to print or install zsh integration with completions and
+  the optional `hssh <host>` helper.
+
 ## v0.6.5
 
 - Add visible `hop <host>` progress while auth and Bastion session renewal are running.

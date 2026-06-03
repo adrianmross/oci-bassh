@@ -118,6 +118,55 @@ func TestHermeticCLIContract(t *testing.T) {
 		t.Fatalf("custom timeout missing from progress\nstderr:\n%s", readyShort.stderr)
 	}
 
+	for _, args := range [][]string{
+		append(helper, "--wait-timeout", "3m", "ensure", "my-vps-01"),
+		append(helper, "ensure", "my-vps-01", "--wait-timeout", "3m"),
+	} {
+		run := runCommandForTest(t, args, env)
+		if run.code != 0 {
+			t.Fatalf("ensure with wait timeout failed with %d\nargs: %v\nstdout:\n%s\nstderr:\n%s", run.code, args, run.stdout, run.stderr)
+		}
+		payload := decodeObject(t, run.stdout)
+		ensure, ok := payload["ensure"].(map[string]any)
+		if !ok {
+			t.Fatalf("ensure payload missing nested ensure command: %#v", payload)
+		}
+		command, ok := ensure["command"].([]any)
+		if !ok {
+			t.Fatalf("nested ensure command missing: %#v", ensure)
+		}
+		if got := strings.Join(jsonStringSlice(t, command), " "); !strings.Contains(got, "--wait-timeout 3m") {
+			t.Fatalf("nested ensure command did not include custom timeout\ncommand: %s", got)
+		}
+	}
+
+	sshRun := runCommandForTest(t, append(helper, "ssh", "my-vps-01"), env)
+	if sshRun.code != 0 {
+		t.Fatalf("ssh fallback command failed with %d\nstdout:\n%s\nstderr:\n%s", sshRun.code, sshRun.stdout, sshRun.stderr)
+	}
+	if got, want := strings.TrimSpace(sshRun.stdout), "connected my-vps-01"; got != want {
+		t.Fatalf("unexpected ssh fallback output\nwant: %q\n got: %q", want, got)
+	}
+
+	setupRun := runCommandForTest(t, append(helper, "setup", "shell"), env)
+	if setupRun.code != 0 {
+		t.Fatalf("setup shell failed with %d\nstdout:\n%s\nstderr:\n%s", setupRun.code, setupRun.stdout, setupRun.stderr)
+	}
+	for _, want := range []string{"hop vmordws02", "oci-hop ssh vmordws02", "hssh()"} {
+		if !strings.Contains(setupRun.stdout, want) {
+			t.Fatalf("setup shell output missing %q\nstdout:\n%s", want, setupRun.stdout)
+		}
+	}
+
+	setupPath := filepath.Join(tmp, "oci-hop.zsh")
+	setupInstall := runCommandForTest(t, append(helper, "setup", "shell", "--install", "--out", setupPath), env)
+	if setupInstall.code != 0 {
+		t.Fatalf("setup shell --install failed with %d\nstdout:\n%s\nstderr:\n%s", setupInstall.code, setupInstall.stdout, setupInstall.stderr)
+	}
+	if data, err := os.ReadFile(setupPath); err != nil || !strings.Contains(string(data), "hssh()") {
+		t.Fatalf("setup shell did not write expected file: err=%v data=%q", err, data)
+	}
+
 	readyJSON := runCommandForTest(t, append(helper, "-o", "json", "my-vps-01"), env)
 	if readyJSON.code != 0 {
 		t.Fatalf("hop host json failed with %d\nstdout:\n%s\nstderr:\n%s", readyJSON.code, readyJSON.stdout, readyJSON.stderr)
@@ -223,7 +272,7 @@ case "$*" in
   "target show my-vps-01 -o json")
     printf '{"name":"my-vps-01","instance_id":"ocid1.instance","private_ip":"10.0.1.25"}\n'
     ;;
-  "ensure my-vps-01 -o json"|"ensure my-vps-01 -o json --wait-timeout 2m"|"ensure my-vps-01 -o json --wait-timeout 15s")
+  "ensure my-vps-01 -o json"|"ensure my-vps-01 -o json --wait-timeout 2m"|"ensure my-vps-01 -o json --wait-timeout 15s"|"ensure my-vps-01 -o json --wait-timeout 3m")
     printf '{"ready":true,"ssh_host":"my-vps-01","connect_command":"ssh my-vps-01","target_private_ip":"10.0.1.25"}\n'
     ;;
   "explain my-vps-01 -o json")
@@ -244,6 +293,9 @@ esac
 	writeExecutable(t, filepath.Join(binDir, "ssh"), `#!/bin/sh
 set -eu
 case "$*" in
+  "my-vps-01")
+    printf 'connected my-vps-01\n'
+    ;;
   "-G my-vps-01")
     printf 'user cloud-user\n'
     printf 'hostname 10.0.1.25\n'
@@ -293,6 +345,19 @@ func decodeObject(t *testing.T, raw string) map[string]any {
 		t.Fatalf("output is not a JSON object: %v\n%s", err, raw)
 	}
 	return payload
+}
+
+func jsonStringSlice(t *testing.T, values []any) []string {
+	t.Helper()
+	out := make([]string, len(values))
+	for i, value := range values {
+		s, ok := value.(string)
+		if !ok {
+			t.Fatalf("expected string at index %d, got %T", i, value)
+		}
+		out[i] = s
+	}
+	return out
 }
 
 func assertRequiredKeys(t *testing.T, schema string, payload map[string]any) {
