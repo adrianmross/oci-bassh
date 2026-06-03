@@ -59,6 +59,23 @@ Create or reuse the bastion session, update SSH config, and stop before SSH:
 hop my-vps-01
 ```
 
+Install shell integration for completions and the optional `hssh` helper:
+
+```bash
+hop setup shell --install
+```
+
+The primary workflow remains `hop <host>` followed by `ssh <host>`. The `hssh`
+helper is for people who want one command that prepares the route and then
+connects.
+
+Use a longer session wait when OCI Bastion takes more time to activate:
+
+```bash
+oci-hop --wait-timeout 3m ensure my-vps-01
+oci-hop ensure my-vps-01 --wait-timeout 3m
+```
+
 Successful preparation prints a compact status line:
 
 ```text
@@ -69,6 +86,12 @@ Connect to the compute instance, not to the bastion alias:
 
 ```bash
 ssh my-vps-01
+```
+
+If you want `oci-hop` to prepare the route and then run the SSH command, use:
+
+```bash
+oci-hop ssh my-vps-01
 ```
 
 ## Host Model

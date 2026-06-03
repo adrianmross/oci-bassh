@@ -119,7 +119,7 @@ func parseRootHopArgs(args []string) (host, identityFile, output, waitTimeout st
 
 func knownRootCommand(name string) bool {
 	switch name {
-	case "doctor", "check", "inspect", "repair", "ensure", "ensure-target", "track", "track-from-terraform", "ssh", "explain", "paths", "upgrade", "version", "completion", "contract-check", "help":
+	case "doctor", "check", "inspect", "repair", "ensure", "ensure-target", "track", "track-from-terraform", "ssh", "explain", "paths", "setup", "upgrade", "version", "completion", "contract-check", "help":
 		return true
 	default:
 		return false
@@ -162,7 +162,7 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	root.Flags().CountVarP(&versionCount, "verbose-version", "v", "print version; repeat for commit and date")
 	root.Flags().StringVarP(&rootOutput, "output", "o", "text", "output format for <host>: text or json")
 	root.Flags().StringVar(&rootIdentityFile, "identity-file", "", "SSH identity file to pass to bastion-session for <host>")
-	root.Flags().StringVar(&rootWaitTimeout, "wait-timeout", defaultWaitTime, "how long to wait for a new Bastion session to become ACTIVE")
+	root.PersistentFlags().StringVar(&rootWaitTimeout, "wait-timeout", defaultWaitTime, "how long to wait for a new Bastion session to become ACTIVE")
 	_ = root.RegisterFlagCompletionFunc("output", outputFormatCompletion)
 	_ = root.RegisterFlagCompletionFunc("identity-file", fileCompletion)
 
@@ -171,13 +171,14 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 		newCheckCommand(),
 		newInspectCommand(),
 		newRepairCommand(),
-		newEnsureCommand("ensure"),
-		newEnsureCommand("ensure-target"),
+		newEnsureCommand("ensure", &rootWaitTimeout),
+		newEnsureCommand("ensure-target", &rootWaitTimeout),
 		newTrackCommand("track"),
 		newTrackCommand("track-from-terraform"),
 		newSSHCommand(),
 		newExplainCommand(),
 		newPathsCommand(),
+		newSetupCommand(),
 		newUpgradeCommand(),
 		newVersionCommand(),
 		newCompletionCommand(root),
@@ -258,7 +259,7 @@ func newRepairCommand() *cobra.Command {
 	return cmd
 }
 
-func newEnsureCommand(name string) *cobra.Command {
+func newEnsureCommand(name string, waitTimeout *string) *cobra.Command {
 	var identityFile string
 	cmd := &cobra.Command{
 		Use:               name + " <host>",
@@ -269,6 +270,9 @@ func newEnsureCommand(name string) *cobra.Command {
 			legacyArgs := []string{}
 			if identityFile != "" {
 				legacyArgs = append(legacyArgs, "--identity-file", identityFile)
+			}
+			if waitTimeout != nil && *waitTimeout != "" {
+				legacyArgs = append(legacyArgs, "--wait-timeout", *waitTimeout)
 			}
 			legacyArgs = append(legacyArgs, args[0])
 			return cmdEnsure(legacyArgs)
@@ -358,6 +362,33 @@ func newPathsCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&format, "output", "o", "text", "output format: json or text")
 	_ = cmd.RegisterFlagCompletionFunc("output", outputFormatCompletion)
+	return cmd
+}
+
+func newSetupCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Install local shell integration",
+	}
+	cmd.AddCommand(newSetupShellCommand())
+	return cmd
+}
+
+func newSetupShellCommand() *cobra.Command {
+	var install bool
+	var shellName string
+	var outPath string
+	cmd := &cobra.Command{
+		Use:   "shell",
+		Short: "Print or install shell integration for hop",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmdSetupShell(shellName, outPath, install)
+		},
+	}
+	cmd.Flags().BoolVar(&install, "install", false, "write the shell integration file")
+	cmd.Flags().StringVar(&shellName, "shell", "zsh", "shell to configure: zsh")
+	cmd.Flags().StringVar(&outPath, "out", "", "output path for --install")
 	return cmd
 }
 
@@ -628,7 +659,7 @@ func cmdRepair(args []string) error {
 }
 
 func cmdEnsure(args []string) error {
-	host, identityFile, err := parseHostIdentity(args)
+	host, identityFile, waitTimeout, err := parseHostIdentityWait(args)
 	if err != nil {
 		return err
 	}
@@ -636,6 +667,9 @@ func cmdEnsure(args []string) error {
 	ensureArgs := []string{"ensure", host, "-o", "json"}
 	if identityFile != "" {
 		ensureArgs = append(ensureArgs, "--identity-file", identityFile)
+	}
+	if waitTimeout != "" {
+		ensureArgs = append(ensureArgs, "--wait-timeout", waitTimeout)
 	}
 	ensured := runJSON("bastion-session", ensureArgs...)
 	sshConfig := runJSON("bastion-session", "ssh-config", "show", host, "-o", "json")
@@ -753,6 +787,69 @@ func cmdPaths(format string) error {
 	default:
 		return cliError{code: 2, msg: "paths output must be json or text"}
 	}
+}
+
+func cmdSetupShell(shellName, outPath string, install bool) error {
+	if shellName != "zsh" {
+		return cliError{code: 2, msg: "only zsh setup is currently supported"}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	if outPath == "" {
+		outPath = filepath.Join(home, ".zshrc.d", "oci-hop.zsh")
+	}
+	snippet := shellIntegrationSnippet()
+	if !install {
+		fmt.Fprint(os.Stdout, snippet)
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return err
+	}
+	tmp := outPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(snippet), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, outPath); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "Wrote %s\n", outPath)
+	return nil
+}
+
+func shellIntegrationSnippet() string {
+	return `# OCI Bastion Hopper shell integration.
+# Primary workflow:
+#   hop vmordws02
+#   ssh vmordws02
+# Fallback without this helper:
+#   oci-hop ssh vmordws02
+
+if command -v hop >/dev/null 2>&1; then
+  alias ohop='hop'
+
+  hssh() {
+    if [[ $# -lt 1 ]]; then
+      print -u2 "Usage: hssh <host> [ssh args...]"
+      return 2
+    fi
+
+    local host="$1"
+    shift
+    hop "$host" || return
+    ssh "$host" "$@"
+  }
+
+  if autoload -Uz compinit 2>/dev/null; then
+    if ! (( $+functions[compdef] )); then
+      compinit -i
+    fi
+    eval "$(hop completion zsh 2>/dev/null)"
+  fi
+fi
+`
 }
 
 func cmdUpgrade(runInstaller bool, prefix, releaseVersion string) error {
@@ -971,6 +1068,37 @@ func parseHostIdentity(args []string) (host, identityFile string, err error) {
 		return "", "", cliError{code: 2, msg: "host is required"}
 	}
 	return host, identityFile, nil
+}
+
+func parseHostIdentityWait(args []string) (host, identityFile, waitTimeout string, err error) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--identity-file":
+			if i+1 >= len(args) {
+				return "", "", "", cliError{code: 2, msg: "--identity-file requires a value"}
+			}
+			identityFile = args[i+1]
+			i++
+		case "--wait-timeout":
+			if i+1 >= len(args) {
+				return "", "", "", cliError{code: 2, msg: "--wait-timeout requires a value"}
+			}
+			waitTimeout = args[i+1]
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return "", "", "", cliError{code: 2, msg: "unknown ensure flag: " + args[i]}
+			}
+			if host != "" {
+				return "", "", "", cliError{code: 2, msg: "unexpected argument: " + args[i]}
+			}
+			host = args[i]
+		}
+	}
+	if strings.TrimSpace(host) == "" {
+		return "", "", "", cliError{code: 2, msg: "host is required"}
+	}
+	return host, identityFile, waitTimeout, nil
 }
 
 func parseRepairArgs(args []string) (host, identityFile string, ensure bool, err error) {
