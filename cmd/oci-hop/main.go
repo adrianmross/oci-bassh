@@ -832,14 +832,14 @@ if command -v hop >/dev/null 2>&1; then
 
   hssh() {
     if [[ $# -lt 1 ]]; then
-      print -u2 "Usage: hssh <host> [ssh args...]"
+      print -u2 "Usage: hssh <host> [ssh options...]"
       return 2
     fi
 
     local host="$1"
     shift
     hop "$host" || return
-    ssh "$host" "$@"
+    ssh "$@" "$host"
   }
 
   if autoload -Uz compinit 2>/dev/null; then

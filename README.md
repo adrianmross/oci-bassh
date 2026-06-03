@@ -67,7 +67,8 @@ hop setup shell --install
 
 The primary workflow remains `hop <host>` followed by `ssh <host>`. The `hssh`
 helper is for people who want one command that prepares the route and then
-connects.
+connects. Pass SSH options after the host, for example `hssh my-vps-01 -L
+8080:127.0.0.1:80`.
 
 Use a longer session wait when OCI Bastion takes more time to activate:
 

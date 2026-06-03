@@ -152,7 +152,7 @@ func TestHermeticCLIContract(t *testing.T) {
 	if setupRun.code != 0 {
 		t.Fatalf("setup shell failed with %d\nstdout:\n%s\nstderr:\n%s", setupRun.code, setupRun.stdout, setupRun.stderr)
 	}
-	for _, want := range []string{"hop vmordws02", "oci-hop ssh vmordws02", "hssh()"} {
+	for _, want := range []string{"hop vmordws02", "oci-hop ssh vmordws02", "hssh()", "ssh \"$@\" \"$host\""} {
 		if !strings.Contains(setupRun.stdout, want) {
 			t.Fatalf("setup shell output missing %q\nstdout:\n%s", want, setupRun.stdout)
 		}
