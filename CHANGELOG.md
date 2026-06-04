@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.7.0
+
+- Add compact interactive progress for `ensure`, including completed steps,
+  Bastion timeout countdown, and a final human-readable ready summary.
+- Keep captured `ensure` output JSON-friendly by default while allowing
+  `ensure -o text` for human-readable output.
+- Stop early when `oci-context auth ensure` fails, surface auth-specific failure
+  details, and point humans and agents at `oci-context auth login`.
 - Let `ensure` and `ensure-target` accept the advertised root `--wait-timeout`
   flag before or after the subcommand and pass it through to
   `bastion-session ensure`.

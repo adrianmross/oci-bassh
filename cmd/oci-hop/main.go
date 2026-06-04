@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -24,6 +26,9 @@ var (
 	version = "dev"
 	commit  = "none"
 	date    = "unknown"
+
+	progressSilent  bool
+	progressVerbose bool
 )
 
 type commandResult struct {
@@ -52,6 +57,8 @@ func main() {
 }
 
 func run(args []string) error {
+	progressSilent = false
+	progressVerbose = false
 	if host, identityFile, output, waitTimeout, handled, err := parseRootHopArgs(args); handled || err != nil {
 		if err != nil {
 			return err
@@ -75,6 +82,10 @@ func parseRootHopArgs(args []string) (host, identityFile, output, waitTimeout st
 			i = len(args)
 		case arg == "-h" || arg == "--help" || arg == "--version" || arg == "--json" || arg == "-v" || arg == "--verbose-version":
 			return "", "", "", "", false, nil
+		case arg == "--silent":
+			progressSilent = true
+		case arg == "--verbose":
+			progressVerbose = true
 		case arg == "-o" || arg == "--output":
 			i++
 			if i >= len(args) {
@@ -163,6 +174,8 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 	root.Flags().StringVarP(&rootOutput, "output", "o", "text", "output format for <host>: text or json")
 	root.Flags().StringVar(&rootIdentityFile, "identity-file", "", "SSH identity file to pass to bastion-session for <host>")
 	root.PersistentFlags().StringVar(&rootWaitTimeout, "wait-timeout", defaultWaitTime, "how long to wait for a new Bastion session to become ACTIVE")
+	root.PersistentFlags().BoolVar(&progressSilent, "silent", false, "suppress progress output on stderr")
+	root.PersistentFlags().BoolVar(&progressVerbose, "verbose", false, "print each progress step instead of compact spinner output")
 	_ = root.RegisterFlagCompletionFunc("output", outputFormatCompletion)
 	_ = root.RegisterFlagCompletionFunc("identity-file", fileCompletion)
 
@@ -261,6 +274,7 @@ func newRepairCommand() *cobra.Command {
 
 func newEnsureCommand(name string, waitTimeout *string) *cobra.Command {
 	var identityFile string
+	var format string
 	cmd := &cobra.Command{
 		Use:               name + " <host>",
 		Short:             "Ensure auth, Bastion session, and SSH config for a host",
@@ -275,10 +289,12 @@ func newEnsureCommand(name string, waitTimeout *string) *cobra.Command {
 				legacyArgs = append(legacyArgs, "--wait-timeout", *waitTimeout)
 			}
 			legacyArgs = append(legacyArgs, args[0])
-			return cmdEnsure(legacyArgs)
+			return cmdEnsure(legacyArgs, format)
 		},
 	}
 	cmd.Flags().StringVar(&identityFile, "identity-file", "", "SSH identity file to pass to bastion-session")
+	cmd.Flags().StringVarP(&format, "output", "o", "auto", "output format: auto, json, or text")
+	_ = cmd.RegisterFlagCompletionFunc("output", autoOutputFormatCompletion)
 	_ = cmd.RegisterFlagCompletionFunc("identity-file", fileCompletion)
 	return cmd
 }
@@ -495,8 +511,23 @@ func cmdHop(host, identityFile, format, waitTimeout string) error {
 	if format != "" && format != "text" && format != "json" {
 		return cliError{code: 2, msg: "output must be json or text"}
 	}
-	hopProgress(format, "checking OCI auth...")
-	auth := runJSON("oci-context", "auth", "ensure", "--output", "json")
+	progress := newProgressReporter(format)
+	defer progress.Done()
+	progress.Step("checking OCI auth...")
+	auth := ensureOCIAuth(progress, format == "text" || format == "")
+	if !auth.OK {
+		out := authFailurePayload(host, "hop failed", auth)
+		switch format {
+		case "json":
+			if err := emit(out); err != nil {
+				return err
+			}
+		case "text", "":
+			progress.Done()
+			emitAuthFailureSummary(host, auth)
+		}
+		return cliError{code: 1, msg: "OCI auth not ready"}
+	}
 	ensureArgs := []string{"ensure", host, "-o", "json"}
 	if identityFile != "" {
 		ensureArgs = append(ensureArgs, "--identity-file", identityFile)
@@ -504,9 +535,9 @@ func cmdHop(host, identityFile, format, waitTimeout string) error {
 	if waitTimeout != "" {
 		ensureArgs = append(ensureArgs, "--wait-timeout", waitTimeout)
 	}
-	hopProgress(format, "ensuring Bastion session for %s (timeout %s)...", host, effectiveWaitTimeout(waitTimeout))
+	progress.StepWithTimeout(waitTimeoutDuration(waitTimeout), "ensuring Bastion session for %s (timeout %s)...", host, effectiveWaitTimeout(waitTimeout))
 	ensured := runJSON("bastion-session", ensureArgs...)
-	hopProgress(format, "refreshing SSH config for %s...", host)
+	progress.Step("refreshing SSH config for %s...", host)
 	sshConfig := runJSON("bastion-session", "ssh-config", "show", host, "-o", "json")
 	ok := auth.OK && ensured.OK && sshConfig.OK
 	out := map[string]any{
@@ -537,18 +568,268 @@ func cmdHop(host, identityFile, format, waitTimeout string) error {
 	return nil
 }
 
-func hopProgress(format, message string, args ...any) {
-	if format != "" && format != "text" {
-		return
-	}
-	fmt.Fprintf(os.Stderr, message+"\n", args...)
-}
-
 func effectiveWaitTimeout(waitTimeout string) string {
 	if strings.TrimSpace(waitTimeout) == "" {
-		return "default"
+		return defaultWaitTime
 	}
 	return waitTimeout
+}
+
+func waitTimeoutDuration(waitTimeout string) time.Duration {
+	parsed, err := time.ParseDuration(effectiveWaitTimeout(waitTimeout))
+	if err != nil {
+		return 0
+	}
+	return parsed
+}
+
+type progressReporter struct {
+	enabled      bool
+	verbose      bool
+	tty          bool
+	mu           sync.Mutex
+	message      string
+	stepStarted  time.Time
+	stepTimeout  time.Duration
+	completed    int
+	totalStarted time.Time
+	stop         chan struct{}
+	done         chan struct{}
+	started      bool
+	stopped      bool
+}
+
+func newProgressReporter(format string) *progressReporter {
+	enabled := !progressSilent && (progressVerbose || format == "" || format == "text")
+	p := &progressReporter{
+		enabled: enabled,
+		verbose: progressVerbose,
+		tty:     stderrIsTerminal(),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	return p
+}
+
+func (p *progressReporter) Step(message string, args ...any) {
+	p.StepWithTimeout(0, message, args...)
+}
+
+func (p *progressReporter) StepWithTimeout(timeout time.Duration, message string, args ...any) {
+	if !p.enabled {
+		return
+	}
+	msg := fmt.Sprintf(message, args...)
+	p.markStarted()
+	if p.verbose || !p.tty {
+		fmt.Fprintln(os.Stderr, msg)
+		return
+	}
+	p.mu.Lock()
+	if p.started {
+		fmt.Fprintf(os.Stderr, "\r\033[K%s %s\n", color("✓", "32", p.tty), p.renderMessage())
+		p.completed++
+	}
+	p.message = msg
+	p.stepStarted = time.Now()
+	p.stepTimeout = timeout
+	if !p.started {
+		p.started = true
+		go p.spin()
+	}
+	p.mu.Unlock()
+}
+
+func (p *progressReporter) markStarted() {
+	p.mu.Lock()
+	if p.totalStarted.IsZero() {
+		p.totalStarted = time.Now()
+	}
+	p.mu.Unlock()
+}
+
+func (p *progressReporter) Elapsed() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.totalStarted.IsZero() {
+		return 0
+	}
+	return time.Since(p.totalStarted)
+}
+
+func (p *progressReporter) Done() {
+	if !p.enabled || p.verbose || !p.tty {
+		return
+	}
+	if p.stopSpinner() {
+		fmt.Fprint(os.Stderr, "\r\033[K")
+	}
+}
+
+func (p *progressReporter) Success(message string, args ...any) bool {
+	if !p.enabled || p.verbose || !p.tty {
+		return false
+	}
+	p.stopSpinner()
+	p.clearProgress()
+	return true
+}
+
+func (p *progressReporter) Interrupt() {
+	if !p.enabled || p.verbose || !p.tty {
+		return
+	}
+	p.stopSpinner()
+	p.clearProgress()
+	p.mu.Lock()
+	p.stop = make(chan struct{})
+	p.done = make(chan struct{})
+	p.started = false
+	p.stopped = false
+	p.completed = 0
+	p.mu.Unlock()
+}
+
+func (p *progressReporter) stopSpinner() bool {
+	p.mu.Lock()
+	if !p.started || p.stopped {
+		p.mu.Unlock()
+		return false
+	}
+	p.stopped = true
+	p.mu.Unlock()
+	close(p.stop)
+	<-p.done
+	return true
+}
+
+func (p *progressReporter) clearProgress() {
+	p.mu.Lock()
+	completed := p.completed
+	p.completed = 0
+	p.started = false
+	p.mu.Unlock()
+
+	fmt.Fprint(os.Stderr, "\r\033[K")
+	for i := 0; i < completed; i++ {
+		fmt.Fprint(os.Stderr, "\033[1A\r\033[K")
+	}
+}
+
+func (p *progressReporter) renderMessage() string {
+	msg := p.message
+	if p.stepTimeout <= 0 {
+		return msg
+	}
+	elapsed := time.Since(p.stepStarted).Truncate(time.Second)
+	remaining := p.stepTimeout - elapsed
+	if remaining < 0 {
+		remaining = 0
+	}
+	return replaceTimeoutLabel(msg, formatCountdown(remaining))
+}
+
+func replaceTimeoutLabel(msg, timeout string) string {
+	const prefix = "(timeout "
+	start := strings.Index(msg, prefix)
+	if start == -1 {
+		return msg
+	}
+	valueStart := start + len(prefix)
+	end := strings.Index(msg[valueStart:], ")")
+	if end == -1 {
+		return msg
+	}
+	return msg[:valueStart] + timeout + msg[valueStart+end:]
+}
+
+func formatCountdown(duration time.Duration) string {
+	duration = duration.Truncate(time.Second)
+	if duration <= 0 {
+		return "0s"
+	}
+	if duration%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(duration/time.Hour))
+	}
+	if duration%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int(duration/time.Minute))
+	}
+	return duration.String()
+}
+
+func (p *progressReporter) spin() {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
+	i := 0
+	for {
+		select {
+		case <-p.stop:
+			close(p.done)
+			return
+		case <-ticker.C:
+			p.mu.Lock()
+			msg := p.renderMessage()
+			p.mu.Unlock()
+			fmt.Fprintf(os.Stderr, "\r\033[K%s %s", frames[i%len(frames)], msg)
+			i++
+		}
+	}
+}
+
+func stderrIsTerminal() bool {
+	info, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func stdoutIsTerminal() bool {
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func stdinIsTerminal() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func styleEnabled() bool {
+	return stdoutIsTerminal()
+}
+
+func color(s, code string, enabled bool) string {
+	if !enabled {
+		return s
+	}
+	return "\033[" + code + "m" + s + "\033[0m"
+}
+
+func bold(s string) string {
+	return color(s, "1", styleEnabled())
+}
+
+func green(s string) string {
+	return color(s, "32", styleEnabled())
+}
+
+func cyan(s string) string {
+	return color(s, "36", styleEnabled())
+}
+
+func dim(s string) string {
+	return color(s, "2", styleEnabled())
+}
+
+func red(s string) string {
+	return color(s, "31", styleEnabled())
 }
 
 func doctorPayload(host string) map[string]any {
@@ -621,12 +902,26 @@ func cmdRepair(args []string) error {
 	connectCommand := "ssh " + host
 	ok := repaired.OK
 	if ensure {
-		auth = runJSON("oci-context", "auth", "ensure", "--output", "json")
+		progress := newProgressReporter("text")
+		defer progress.Done()
+		progress.Step("checking OCI auth...")
+		auth = ensureOCIAuth(progress, true)
+		if !auth.OK {
+			out := authFailurePayload(host, "repair failed", auth)
+			out["repair"] = repaired
+			out["ensure_requested"] = ensure
+			if err := emit(out); err != nil {
+				return err
+			}
+			return cliError{code: 1, msg: "OCI auth not ready"}
+		}
 		ensureArgs := []string{"ensure", host, "-o", "json"}
 		if identityFile != "" {
 			ensureArgs = append(ensureArgs, "--identity-file", identityFile)
 		}
+		progress.Step("ensuring Bastion session for %s...", host)
 		ensured = runJSON("bastion-session", ensureArgs...)
+		progress.Step("refreshing SSH config for %s...", host)
 		sshConfig = runJSON("bastion-session", "ssh-config", "show", host, "-o", "json")
 		ok = auth.OK && ensured.OK && sshConfig.OK
 		connectCommand = connectCommandFrom(host, ensured)
@@ -658,12 +953,32 @@ func cmdRepair(args []string) error {
 	return nil
 }
 
-func cmdEnsure(args []string) error {
+func cmdEnsure(args []string, format string) error {
 	host, identityFile, waitTimeout, err := parseHostIdentityWait(args)
 	if err != nil {
 		return err
 	}
-	auth := runJSON("oci-context", "auth", "ensure", "--output", "json")
+	format = resolveAutoOutput(format)
+	if format != "json" && format != "text" {
+		return cliError{code: 2, msg: "ensure output must be auto, json, or text"}
+	}
+	progress := newProgressReporter(format)
+	defer progress.Done()
+	progress.Step("checking OCI auth...")
+	auth := ensureOCIAuth(progress, format == "text")
+	if !auth.OK {
+		out := authFailurePayload(host, "ensure failed", auth)
+		switch format {
+		case "json":
+			if err := emit(out); err != nil {
+				return err
+			}
+		case "text":
+			progress.Done()
+			emitAuthFailureSummary(host, auth)
+		}
+		return cliError{code: 1, msg: "OCI auth not ready"}
+	}
 	ensureArgs := []string{"ensure", host, "-o", "json"}
 	if identityFile != "" {
 		ensureArgs = append(ensureArgs, "--identity-file", identityFile)
@@ -671,7 +986,9 @@ func cmdEnsure(args []string) error {
 	if waitTimeout != "" {
 		ensureArgs = append(ensureArgs, "--wait-timeout", waitTimeout)
 	}
+	progress.StepWithTimeout(waitTimeoutDuration(waitTimeout), "ensuring Bastion session for %s (timeout %s)...", host, effectiveWaitTimeout(waitTimeout))
 	ensured := runJSON("bastion-session", ensureArgs...)
+	progress.Step("refreshing SSH config for %s...", host)
 	sshConfig := runJSON("bastion-session", "ssh-config", "show", host, "-o", "json")
 	ok := auth.OK && ensured.OK && sshConfig.OK
 	connectCommand := connectCommandFrom(host, ensured)
@@ -686,13 +1003,193 @@ func cmdEnsure(args []string) error {
 	if !ok {
 		out["issue"] = firstIssue("ensure failed", nextForHost(commandName()+" repair --ensure", host), auth, ensured, sshConfig)
 	}
-	if err := emit(out); err != nil {
-		return err
+	switch format {
+	case "json":
+		if err := emit(out); err != nil {
+			return err
+		}
+	case "text":
+		if ok {
+			elapsed := progress.Elapsed()
+			progress.Success("%s ready in %s", host, formatElapsed(elapsed))
+			emitEnsureSummary(host, elapsed, ensured, sshConfig, connectCommand)
+		} else if err := emit(out); err != nil {
+			return err
+		}
 	}
 	if !ok {
 		return cliError{code: 1, msg: "ensure failed"}
 	}
 	return nil
+}
+
+func resolveAutoOutput(format string) string {
+	switch strings.TrimSpace(format) {
+	case "", "auto":
+		if stdoutIsTerminal() {
+			return "text"
+		}
+		return "json"
+	default:
+		return format
+	}
+}
+
+func emitEnsureSummary(host string, elapsed time.Duration, ensured, sshConfig commandResult, connectCommand string) {
+	fmt.Fprintf(os.Stdout, "%s\n", green(host+" ready in "+formatElapsed(elapsed)))
+	fmt.Fprintln(os.Stdout, dim("---"))
+	if lifecycle := stringFieldFromJSON(ensured, "session_lifecycle"); lifecycle != "" {
+		line := lifecycle
+		if expires := stringFieldFromJSON(ensured, "expires_at"); expires != "" {
+			line += " " + dim("until") + " " + expires
+		}
+		printSummaryField("bastion session", line)
+	}
+	if hostname := firstStringFieldFromJSON(sshConfig, "hostname"); hostname != "" {
+		if proxyJump := firstStringFieldFromJSON(sshConfig, "proxyjump", "proxy_jump"); proxyJump != "" {
+			printSummaryField("ssh route", hostname+" "+dim("via")+" "+proxyJump)
+		} else {
+			printSummaryField("ssh route", hostname)
+		}
+	}
+	if identity := firstStringFieldFromJSON(sshConfig, "identity_file"); identity != "" {
+		printSummaryField("identity", identity)
+	}
+	fmt.Fprintln(os.Stdout, dim("---"))
+	fmt.Fprintln(os.Stdout, dim(connectCommand))
+}
+
+func ensureOCIAuth(progress *progressReporter, allowInteractiveLogin bool) commandResult {
+	auth := runJSON("oci-context", "auth", "ensure", "--output", "json")
+	if auth.OK || !allowInteractiveLogin || !authRequiresLogin(auth) || !stdinIsTerminal() || !stderrIsTerminal() {
+		return auth
+	}
+	progress.Interrupt()
+	loginCommand := authLoginCommand(auth)
+	fmt.Fprintf(os.Stderr, "%s OCI auth requires login; running `%s`.\n", red("!"), loginCommand)
+	login := runInteractiveShellCommand(loginCommand)
+	if !login.OK {
+		return auth
+	}
+	progress.Step("checking OCI auth...")
+	return runJSON("oci-context", "auth", "ensure", "--output", "json")
+}
+
+func runInteractiveShellCommand(command string) commandResult {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return commandResult{OK: false, ExitCode: 2, ErrorCode: "command_error", Message: "missing command"}
+	}
+	cmd := exec.Command("sh", "-lc", command)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err == nil {
+		return commandResult{Command: []string{"sh", "-lc", command}, OK: true, ExitCode: 0}
+	}
+	rc := 1
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		rc = ee.ExitCode()
+	}
+	return commandResult{Command: []string{"sh", "-lc", command}, OK: false, ExitCode: rc, ErrorCode: "command_failed", Message: err.Error()}
+}
+
+func authFailurePayload(host, message string, auth commandResult) map[string]any {
+	return map[string]any{
+		"ok":              false,
+		"host":            host,
+		"auth":            auth,
+		"ensure":          commandResult{},
+		"ssh_config":      commandResult{},
+		"connect_command": "ssh " + host,
+		"issue":           authIssue(message, auth),
+	}
+}
+
+func emitAuthFailureSummary(host string, auth commandResult) {
+	fmt.Fprintf(os.Stdout, "%s\n", red(host+" not ready"))
+	fmt.Fprintln(os.Stdout, dim("---"))
+	printSummaryField("oci auth", authStatus(auth))
+	if context := stringFieldFromJSON(auth, "context"); context != "" {
+		if method := stringFieldFromJSON(auth, "auth_method"); method != "" {
+			printSummaryField("context", context+" "+dim("via")+" "+method)
+		} else {
+			printSummaryField("context", context)
+		}
+	}
+	if msg := authMessage(auth); msg != "" {
+		printSummaryField("reason", msg)
+	}
+	fmt.Fprintln(os.Stdout, dim("---"))
+	fmt.Fprintln(os.Stdout, dim(authLoginCommand(auth)))
+}
+
+func authIssue(message string, auth commandResult) issue {
+	nextCommand := authLoginCommand(auth)
+	code := "oci_auth_failed"
+	if state := stringFieldFromJSON(auth, "state"); state != "" {
+		code = "oci_auth_" + strings.ReplaceAll(state, "-", "_")
+	} else if action := stringFieldFromJSON(auth, "action"); action != "" && action != "none" {
+		code = "oci_auth_" + strings.ReplaceAll(action, "-", "_")
+	}
+	if msg := authMessage(auth); msg != "" {
+		message = msg
+	}
+	return issue{ErrorCode: code, Message: message, NextCommand: nextCommand}
+}
+
+func authStatus(auth commandResult) string {
+	if state := stringFieldFromJSON(auth, "state"); state != "" {
+		return strings.ReplaceAll(state, "_", " ")
+	}
+	if authRequiresLogin(auth) {
+		return "login required"
+	}
+	return "not ready"
+}
+
+func authMessage(auth commandResult) string {
+	for _, key := range []string{"message", "error"} {
+		if msg := stringFieldFromJSON(auth, key); msg != "" {
+			return msg
+		}
+	}
+	if auth.Message != "" {
+		return auth.Message
+	}
+	return strings.TrimSpace(auth.Stderr)
+}
+
+func authRequiresLogin(auth commandResult) bool {
+	if boolFieldFromJSON(auth, "login_required") {
+		return true
+	}
+	action := stringFieldFromJSON(auth, "action")
+	state := stringFieldFromJSON(auth, "state")
+	return action == "login" || state == "login_required" || state == "login_failed"
+}
+
+func authLoginCommand(auth commandResult) string {
+	if cmd := stringFieldFromJSON(auth, "login_command"); cmd != "" {
+		return cmd
+	}
+	return "oci-context auth login"
+}
+
+func printSummaryField(label, value string) {
+	fmt.Fprintf(os.Stdout, "%s %s\n", bold(fmt.Sprintf("%-15s", label)), value)
+}
+
+func formatElapsed(elapsed time.Duration) string {
+	if elapsed <= 0 {
+		return "0s"
+	}
+	if elapsed < time.Second {
+		return elapsed.Truncate(time.Millisecond).String()
+	}
+	return elapsed.Truncate(time.Second).String()
 }
 
 func cmdTrack(args []string) error {
@@ -723,11 +1220,23 @@ func cmdSSH(args []string) error {
 	if err != nil {
 		return err
 	}
-	auth := runJSON("oci-context", "auth", "ensure", "--output", "json")
+	progress := newProgressReporter("text")
+	defer progress.Done()
+	progress.Step("checking OCI auth...")
+	auth := ensureOCIAuth(progress, true)
+	if !auth.OK {
+		out := authFailurePayload(host, "ssh preparation failed", auth)
+		out["ssh_command"] = append([]string{"ssh", host}, sshArgs...)
+		if err := emit(out); err != nil {
+			return err
+		}
+		return cliError{code: 1, msg: "OCI auth not ready"}
+	}
 	ensureArgs := []string{"ensure", host, "-o", "json"}
 	if identityFile != "" {
 		ensureArgs = append(ensureArgs, "--identity-file", identityFile)
 	}
+	progress.Step("ensuring Bastion session for %s...", host)
 	ensured := runJSON("bastion-session", ensureArgs...)
 	ok := auth.OK && ensured.OK
 	sshCmd := append([]string{"ssh", host}, sshArgs...)
@@ -1014,6 +1523,18 @@ func stringFieldFromJSON(result commandResult, key string) string {
 		return ""
 	}
 	value, _ := obj[key].(string)
+	return value
+}
+
+func boolFieldFromJSON(result commandResult, key string) bool {
+	if result.JSON == nil {
+		return false
+	}
+	var obj map[string]any
+	if json.Unmarshal(*result.JSON, &obj) != nil {
+		return false
+	}
+	value, _ := obj[key].(bool)
 	return value
 }
 
@@ -1320,6 +1841,10 @@ func dirCompletion(cmd *cobra.Command, args []string, toComplete string) ([]stri
 
 func outputFormatCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 	return []string{"json", "text"}, cobra.ShellCompDirectiveNoFileComp
+}
+
+func autoOutputFormatCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	return []string{"auto", "json", "text"}, cobra.ShellCompDirectiveNoFileComp
 }
 
 func completeTargets(raw json.RawMessage, prefix string) []string {

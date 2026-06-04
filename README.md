@@ -77,6 +77,13 @@ oci-hop --wait-timeout 3m ensure my-vps-01
 oci-hop ensure my-vps-01 --wait-timeout 3m
 ```
 
+Text commands print compact progress on stderr while they prepare auth,
+Bastion, and SSH config. In an interactive terminal, `ensure` defaults to a
+small human summary; when stdout is captured it keeps JSON output for tools and
+agents. Use `ensure -o text` or `ensure -o json` to force the format,
+`--silent` to suppress progress output, or `--verbose` to print every progress
+step as plain log lines.
+
 Successful preparation prints a compact status line:
 
 ```text

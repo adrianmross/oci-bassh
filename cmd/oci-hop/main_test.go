@@ -118,6 +118,85 @@ func TestHermeticCLIContract(t *testing.T) {
 		t.Fatalf("custom timeout missing from progress\nstderr:\n%s", readyShort.stderr)
 	}
 
+	silentEnsure := runCommandForTest(t, append(helper, "--silent", "ensure", "my-vps-01"), env)
+	if silentEnsure.code != 0 {
+		t.Fatalf("silent ensure failed with %d\nstdout:\n%s\nstderr:\n%s", silentEnsure.code, silentEnsure.stdout, silentEnsure.stderr)
+	}
+	if strings.TrimSpace(silentEnsure.stderr) != "" {
+		t.Fatalf("--silent should suppress progress stderr:\n%s", silentEnsure.stderr)
+	}
+
+	verboseEnsure := runCommandForTest(t, append(helper, "--verbose", "ensure", "my-vps-01"), env)
+	if verboseEnsure.code != 0 {
+		t.Fatalf("verbose ensure failed with %d\nstdout:\n%s\nstderr:\n%s", verboseEnsure.code, verboseEnsure.stdout, verboseEnsure.stderr)
+	}
+	for _, want := range []string{
+		"checking OCI auth...",
+		"ensuring Bastion session for my-vps-01 (timeout 2m)...",
+		"refreshing SSH config for my-vps-01...",
+	} {
+		if !strings.Contains(verboseEnsure.stderr, want) {
+			t.Fatalf("verbose ensure stderr missing %q\nstderr:\n%s", want, verboseEnsure.stderr)
+		}
+	}
+
+	textEnsure := runCommandForTest(t, append(helper, "ensure", "my-vps-01", "-o", "text"), env)
+	if textEnsure.code != 0 {
+		t.Fatalf("text ensure failed with %d\nstdout:\n%s\nstderr:\n%s", textEnsure.code, textEnsure.stdout, textEnsure.stderr)
+	}
+	for _, want := range []string{
+		"my-vps-01 ready in ",
+		"bastion session ACTIVE",
+		"ssh route       10.0.1.25 via my-bastion",
+		"identity        ~/.ssh/id_rsa",
+		"---",
+		"ssh my-vps-01",
+	} {
+		if !strings.Contains(textEnsure.stdout, want) {
+			t.Fatalf("text ensure stdout missing %q\nstdout:\n%s", want, textEnsure.stdout)
+		}
+	}
+
+	jsonEnsure := runCommandForTest(t, append(helper, "ensure", "my-vps-01", "-o", "json"), env)
+	if jsonEnsure.code != 0 {
+		t.Fatalf("json ensure failed with %d\nstdout:\n%s\nstderr:\n%s", jsonEnsure.code, jsonEnsure.stdout, jsonEnsure.stderr)
+	}
+	decodeObject(t, jsonEnsure.stdout)
+	if strings.TrimSpace(jsonEnsure.stderr) != "" {
+		t.Fatalf("forced json ensure should not include progress stderr:\n%s", jsonEnsure.stderr)
+	}
+
+	authFailEnv := append([]string{}, env...)
+	authFailEnv = append(authFailEnv, "OCI_CONTEXT_AUTH_FAIL=1", "BASTION_SESSION_FAIL_IF_CALLED=1")
+	textAuthFail := runCommandForTest(t, append(helper, "ensure", "my-vps-01", "-o", "text"), authFailEnv)
+	if textAuthFail.code == 0 {
+		t.Fatalf("text ensure should fail when OCI auth is not ready\nstdout:\n%s", textAuthFail.stdout)
+	}
+	for _, want := range []string{
+		"my-vps-01 not ready",
+		"oci auth        login required",
+		"context         dev via security_token",
+		"reason          run oci-context auth login in an interactive shell",
+		"oci-context auth login",
+	} {
+		if !strings.Contains(textAuthFail.stdout, want) {
+			t.Fatalf("auth failure stdout missing %q\nstdout:\n%s", want, textAuthFail.stdout)
+		}
+	}
+
+	jsonAuthFail := runCommandForTest(t, append(helper, "ensure", "my-vps-01", "-o", "json"), authFailEnv)
+	if jsonAuthFail.code == 0 {
+		t.Fatalf("json ensure should fail when OCI auth is not ready\nstdout:\n%s", jsonAuthFail.stdout)
+	}
+	authFailPayload := decodeObject(t, jsonAuthFail.stdout)
+	issue, ok := authFailPayload["issue"].(map[string]any)
+	if !ok {
+		t.Fatalf("auth failure json missing issue: %#v", authFailPayload)
+	}
+	if issue["error_code"] != "oci_auth_login_required" || issue["next_command"] != "oci-context auth login" {
+		t.Fatalf("auth failure issue did not preserve login next step: %#v", issue)
+	}
+
 	for _, args := range [][]string{
 		append(helper, "--wait-timeout", "3m", "ensure", "my-vps-01"),
 		append(helper, "ensure", "my-vps-01", "--wait-timeout", "3m"),
@@ -228,6 +307,10 @@ func writeHermeticShims(t *testing.T, binDir string) {
 set -eu
 case "$*" in
   "auth ensure --output json")
+    if [ "${OCI_CONTEXT_AUTH_FAIL:-}" ]; then
+      printf '{"ok":false,"state":"login_required","context":"dev","profile":"DEFAULT","auth_method":"security_token","login_required":true,"action_required":true,"action":"login","severity":"error","login_command":"oci-context auth login","message":"run oci-context auth login in an interactive shell"}\n'
+      exit 1
+    fi
     printf '{"ok":true,"state":"ready","context":"dev","profile":"DEFAULT","auth_method":"api_key"}\n'
     ;;
   "status --cached -o json")
@@ -273,13 +356,21 @@ case "$*" in
     printf '{"name":"my-vps-01","instance_id":"ocid1.instance","private_ip":"10.0.1.25"}\n'
     ;;
   "ensure my-vps-01 -o json"|"ensure my-vps-01 -o json --wait-timeout 2m"|"ensure my-vps-01 -o json --wait-timeout 15s"|"ensure my-vps-01 -o json --wait-timeout 3m")
-    printf '{"ready":true,"ssh_host":"my-vps-01","connect_command":"ssh my-vps-01","target_private_ip":"10.0.1.25"}\n'
+    if [ "${BASTION_SESSION_FAIL_IF_CALLED:-}" ]; then
+      printf 'bastion-session should not have been called\n' >&2
+      exit 1
+    fi
+    printf '{"ready":true,"ssh_host":"my-vps-01","connect_command":"ssh my-vps-01","target_private_ip":"10.0.1.25","session_lifecycle":"ACTIVE","expires_at":"2026-06-04T23:01:10Z"}\n'
     ;;
   "explain my-vps-01 -o json")
     printf '{"host":"my-vps-01","target":"10.0.1.25","proxyjump":"my-bastion","connect_command":"ssh my-vps-01"}\n'
     ;;
   "ssh-config show my-vps-01 -o json")
-    printf '{"host":"my-vps-01","hostname":"10.0.1.25","user":"cloud-user","proxyjump":"my-bastion"}\n'
+    if [ "${BASTION_SESSION_FAIL_IF_CALLED:-}" ]; then
+      printf 'bastion-session should not have been called\n' >&2
+      exit 1
+    fi
+    printf '{"host":"my-vps-01","hostname":"10.0.1.25","user":"cloud-user","proxyjump":"my-bastion","identity_file":"~/.ssh/id_rsa"}\n'
     ;;
   status*)
     printf '{"session_id":"ocid1.session","lifecycle":"ACTIVE"}\n'
