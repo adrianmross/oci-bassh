@@ -217,6 +217,9 @@ func TestHermeticCLIContract(t *testing.T) {
 		if got := strings.Join(jsonStringSlice(t, command), " "); !strings.Contains(got, "--wait-timeout 3m") {
 			t.Fatalf("nested ensure command did not include custom timeout\ncommand: %s", got)
 		}
+		if got := strings.Join(jsonStringSlice(t, command), " "); !strings.Contains(got, "--session-ttl 24h") {
+			t.Fatalf("nested ensure command did not include default session TTL\ncommand: %s", got)
+		}
 	}
 
 	sshRun := runCommandForTest(t, append(helper, "ssh", "my-vps-01"), env)
@@ -355,7 +358,7 @@ case "$*" in
   "target show my-vps-01 -o json")
     printf '{"name":"my-vps-01","instance_id":"ocid1.instance","private_ip":"10.0.1.25"}\n'
     ;;
-  "ensure my-vps-01 -o json"|"ensure my-vps-01 -o json --wait-timeout 2m"|"ensure my-vps-01 -o json --wait-timeout 15s"|"ensure my-vps-01 -o json --wait-timeout 3m")
+  "ensure my-vps-01 -o json --session-ttl 24h"|"ensure my-vps-01 -o json --session-ttl 24h --wait-timeout 2m"|"ensure my-vps-01 -o json --session-ttl 24h --wait-timeout 15s"|"ensure my-vps-01 -o json --session-ttl 24h --wait-timeout 3m")
     if [ "${BASTION_SESSION_FAIL_IF_CALLED:-}" ]; then
       printf 'bastion-session should not have been called\n' >&2
       exit 1

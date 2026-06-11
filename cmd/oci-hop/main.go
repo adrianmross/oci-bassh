@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	primaryCommand   = "hop"
-	qualifiedCommand = "oci-hop"
-	defaultWaitTime  = "2m"
+	primaryCommand    = "hop"
+	qualifiedCommand  = "oci-hop"
+	defaultWaitTime   = "2m"
+	defaultSessionTTL = "24h"
 )
 
 var (
@@ -528,13 +529,7 @@ func cmdHop(host, identityFile, format, waitTimeout string) error {
 		}
 		return cliError{code: 1, msg: "OCI auth not ready"}
 	}
-	ensureArgs := []string{"ensure", host, "-o", "json"}
-	if identityFile != "" {
-		ensureArgs = append(ensureArgs, "--identity-file", identityFile)
-	}
-	if waitTimeout != "" {
-		ensureArgs = append(ensureArgs, "--wait-timeout", waitTimeout)
-	}
+	ensureArgs := bastionEnsureArgs(host, identityFile, waitTimeout)
 	progress.StepWithTimeout(waitTimeoutDuration(waitTimeout), "ensuring Bastion session for %s (timeout %s)...", host, effectiveWaitTimeout(waitTimeout))
 	ensured := runJSON("bastion-session", ensureArgs...)
 	progress.Step("refreshing SSH config for %s...", host)
@@ -581,6 +576,17 @@ func waitTimeoutDuration(waitTimeout string) time.Duration {
 		return 0
 	}
 	return parsed
+}
+
+func bastionEnsureArgs(host, identityFile, waitTimeout string) []string {
+	ensureArgs := []string{"ensure", host, "-o", "json", "--session-ttl", defaultSessionTTL}
+	if identityFile != "" {
+		ensureArgs = append(ensureArgs, "--identity-file", identityFile)
+	}
+	if waitTimeout != "" {
+		ensureArgs = append(ensureArgs, "--wait-timeout", waitTimeout)
+	}
+	return ensureArgs
 }
 
 type progressReporter struct {
@@ -915,10 +921,7 @@ func cmdRepair(args []string) error {
 			}
 			return cliError{code: 1, msg: "OCI auth not ready"}
 		}
-		ensureArgs := []string{"ensure", host, "-o", "json"}
-		if identityFile != "" {
-			ensureArgs = append(ensureArgs, "--identity-file", identityFile)
-		}
+		ensureArgs := bastionEnsureArgs(host, identityFile, "")
 		progress.Step("ensuring Bastion session for %s...", host)
 		ensured = runJSON("bastion-session", ensureArgs...)
 		progress.Step("refreshing SSH config for %s...", host)
@@ -979,13 +982,7 @@ func cmdEnsure(args []string, format string) error {
 		}
 		return cliError{code: 1, msg: "OCI auth not ready"}
 	}
-	ensureArgs := []string{"ensure", host, "-o", "json"}
-	if identityFile != "" {
-		ensureArgs = append(ensureArgs, "--identity-file", identityFile)
-	}
-	if waitTimeout != "" {
-		ensureArgs = append(ensureArgs, "--wait-timeout", waitTimeout)
-	}
+	ensureArgs := bastionEnsureArgs(host, identityFile, waitTimeout)
 	progress.StepWithTimeout(waitTimeoutDuration(waitTimeout), "ensuring Bastion session for %s (timeout %s)...", host, effectiveWaitTimeout(waitTimeout))
 	ensured := runJSON("bastion-session", ensureArgs...)
 	progress.Step("refreshing SSH config for %s...", host)
@@ -1232,10 +1229,7 @@ func cmdSSH(args []string) error {
 		}
 		return cliError{code: 1, msg: "OCI auth not ready"}
 	}
-	ensureArgs := []string{"ensure", host, "-o", "json"}
-	if identityFile != "" {
-		ensureArgs = append(ensureArgs, "--identity-file", identityFile)
-	}
+	ensureArgs := bastionEnsureArgs(host, identityFile, "")
 	progress.Step("ensuring Bastion session for %s...", host)
 	ensured := runJSON("bastion-session", ensureArgs...)
 	ok := auth.OK && ensured.OK

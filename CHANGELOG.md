@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.7.1
+
+- Request 24-hour Bastion sessions when preparing host SSH routes while still
+  respecting the selected Bastion resource's configured maximum TTL.
+
 ## v0.7.0
 
 - Add compact interactive progress for `ensure`, including completed steps,

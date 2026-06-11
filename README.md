@@ -77,6 +77,10 @@ oci-hop --wait-timeout 3m ensure my-vps-01
 oci-hop ensure my-vps-01 --wait-timeout 3m
 ```
 
+`hop` requests a 24-hour Bastion session TTL when it creates a new session. OCI
+still caps the actual session lifetime at the selected Bastion resource's
+configured maximum.
+
 Text commands print compact progress on stderr while they prepare auth,
 Bastion, and SSH config. In an interactive terminal, `ensure` defaults to a
 small human summary; when stdout is captured it keeps JSON output for tools and
