@@ -77,7 +77,7 @@ oci-hop --wait-timeout 3m ensure my-vps-01
 oci-hop ensure my-vps-01 --wait-timeout 3m
 ```
 
-`hop` requests a 24-hour Bastion session TTL when it creates a new session. OCI
+`hop` requests a 3-hour Bastion session TTL when it creates a new session. OCI
 still caps the actual session lifetime at the selected Bastion resource's
 configured maximum.
 
@@ -104,6 +104,13 @@ If you want `oci-hop` to prepare the route and then run the SSH command, use:
 
 ```bash
 oci-hop ssh my-vps-01
+```
+
+To reconnect after SSH transport disconnects, pass `--reconnect`. SSH options
+and remote commands belong after `--` so `oci-hop` does not parse them:
+
+```bash
+hop ssh --reconnect my-vps-01 -- -t tmux new -s 0 -AE
 ```
 
 ## Host Model

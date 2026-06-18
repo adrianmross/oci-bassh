@@ -74,6 +74,7 @@ func TestHermeticCLIContract(t *testing.T) {
 		{"oci-hop-track.schema.json", append(helper, "track", "my-vps-01", "--terraform-dir", tmp)},
 		{"oci-hop-ssh.schema.json", append(helper, "ssh", "--dry-run", "my-vps-01")},
 		{"oci-hop-ssh.schema.json", append(helper, "ssh", "--dry-run", "my-vps-01", "-p", "2222")},
+		{"oci-hop-ssh.schema.json", append(helper, "ssh", "--dry-run", "--reconnect", "my-vps-01", "--", "-t", "tmux", "new", "-s", "0", "-AE")},
 		{"oci-hop-explain.schema.json", append(helper, "explain", "my-vps-01")},
 		{"oci-hop-paths.schema.json", append(helper, "paths", "-o", "json")},
 		{"oci-hop-upgrade.schema.json", append(helper, "upgrade")},
@@ -217,7 +218,7 @@ func TestHermeticCLIContract(t *testing.T) {
 		if got := strings.Join(jsonStringSlice(t, command), " "); !strings.Contains(got, "--wait-timeout 3m") {
 			t.Fatalf("nested ensure command did not include custom timeout\ncommand: %s", got)
 		}
-		if got := strings.Join(jsonStringSlice(t, command), " "); !strings.Contains(got, "--session-ttl 24h") {
+		if got := strings.Join(jsonStringSlice(t, command), " "); !strings.Contains(got, "--session-ttl 3h") {
 			t.Fatalf("nested ensure command did not include default session TTL\ncommand: %s", got)
 		}
 	}
@@ -228,6 +229,19 @@ func TestHermeticCLIContract(t *testing.T) {
 	}
 	if got, want := strings.TrimSpace(sshRun.stdout), "connected my-vps-01"; got != want {
 		t.Fatalf("unexpected ssh fallback output\nwant: %q\n got: %q", want, got)
+	}
+
+	reconnectEnv := append([]string{}, env...)
+	reconnectEnv = append(reconnectEnv, "OCI_HOP_TEST_SSH_FAIL_ONCE="+filepath.Join(tmp, "ssh-failed-once"))
+	reconnectRun := runCommandForTest(t, append(helper, "ssh", "--reconnect", "my-vps-01", "--", "-t", "tmux", "new", "-s", "0", "-AE"), reconnectEnv)
+	if reconnectRun.code != 0 {
+		t.Fatalf("ssh reconnect command failed with %d\nstdout:\n%s\nstderr:\n%s", reconnectRun.code, reconnectRun.stdout, reconnectRun.stderr)
+	}
+	if got, want := strings.TrimSpace(reconnectRun.stdout), "connected my-vps-01 -t tmux new -s 0 -AE"; got != want {
+		t.Fatalf("unexpected ssh reconnect output\nwant: %q\n got: %q", want, got)
+	}
+	if !strings.Contains(reconnectRun.stderr, "reconnecting to my-vps-01 after SSH transport disconnect") {
+		t.Fatalf("ssh reconnect stderr missing reconnect notice:\n%s", reconnectRun.stderr)
 	}
 
 	setupRun := runCommandForTest(t, append(helper, "setup", "shell"), env)
@@ -358,7 +372,7 @@ case "$*" in
   "target show my-vps-01 -o json")
     printf '{"name":"my-vps-01","instance_id":"ocid1.instance","private_ip":"10.0.1.25"}\n'
     ;;
-  "ensure my-vps-01 -o json --session-ttl 24h"|"ensure my-vps-01 -o json --session-ttl 24h --wait-timeout 2m"|"ensure my-vps-01 -o json --session-ttl 24h --wait-timeout 15s"|"ensure my-vps-01 -o json --session-ttl 24h --wait-timeout 3m")
+  "ensure my-vps-01 -o json --session-ttl 3h"|"ensure my-vps-01 -o json --session-ttl 3h --wait-timeout 2m"|"ensure my-vps-01 -o json --session-ttl 3h --wait-timeout 15s"|"ensure my-vps-01 -o json --session-ttl 3h --wait-timeout 3m")
     if [ "${BASTION_SESSION_FAIL_IF_CALLED:-}" ]; then
       printf 'bastion-session should not have been called\n' >&2
       exit 1
@@ -387,8 +401,12 @@ esac
 	writeExecutable(t, filepath.Join(binDir, "ssh"), `#!/bin/sh
 set -eu
 case "$*" in
-  "my-vps-01")
-    printf 'connected my-vps-01\n'
+  "my-vps-01"|"my-vps-01 -t tmux new -s 0 -AE")
+    if [ "${OCI_HOP_TEST_SSH_FAIL_ONCE:-}" ] && [ ! -f "${OCI_HOP_TEST_SSH_FAIL_ONCE}" ]; then
+      : > "${OCI_HOP_TEST_SSH_FAIL_ONCE}"
+      exit 255
+    fi
+    printf 'connected %s\n' "$*"
     ;;
   "-G my-vps-01")
     printf 'user cloud-user\n'

@@ -20,7 +20,7 @@ const (
 	primaryCommand    = "hop"
 	qualifiedCommand  = "oci-hop"
 	defaultWaitTime   = "2m"
-	defaultSessionTTL = "24h"
+	defaultSessionTTL = "3h"
 )
 
 var (
@@ -337,7 +337,7 @@ func newSSHCommand() *cobra.Command {
 	var dryRun bool
 	var identityFile string
 	cmd := &cobra.Command{
-		Use:                   "ssh [--dry-run] [--identity-file PATH] <host> [-- ssh args...]",
+		Use:                   "ssh [--dry-run] [--reconnect] [--identity-file PATH] <host> [-- ssh args...]",
 		Short:                 "Ensure setup and connect with ssh",
 		ValidArgsFunction:     hostCompletion,
 		DisableFlagParsing:    true,
@@ -350,6 +350,7 @@ func newSSHCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "emit JSON with the ssh command instead of connecting")
+	cmd.Flags().Bool("reconnect", false, "reconnect after SSH transport disconnects")
 	cmd.Flags().StringVar(&identityFile, "identity-file", "", "SSH identity file to pass to bastion-session")
 	_ = cmd.RegisterFlagCompletionFunc("identity-file", fileCompletion)
 	return cmd
@@ -1213,9 +1214,12 @@ func cmdTrack(args []string) error {
 }
 
 func cmdSSH(args []string) error {
-	host, identityFile, dryRun, sshArgs, err := parseSSHArgs(args)
+	host, identityFile, dryRun, reconnect, sshArgs, err := parseSSHArgs(args)
 	if err != nil {
 		return err
+	}
+	if reconnect && !dryRun {
+		return runSSHReconnect(host, identityFile, sshArgs)
 	}
 	progress := newProgressReporter("text")
 	defer progress.Done()
@@ -1235,7 +1239,7 @@ func cmdSSH(args []string) error {
 	ok := auth.OK && ensured.OK
 	sshCmd := append([]string{"ssh", host}, sshArgs...)
 	if dryRun {
-		out := map[string]any{"ok": ok, "host": host, "auth": auth, "ensure": ensured, "ssh_command": sshCmd}
+		out := map[string]any{"ok": ok, "host": host, "auth": auth, "ensure": ensured, "ssh_command": sshCmd, "reconnect": reconnect}
 		if !ok {
 			out["issue"] = firstIssue("ssh preparation failed", nextForHost(commandName()+" repair --ensure", host), auth, ensured)
 		}
@@ -1255,6 +1259,59 @@ func cmdSSH(args []string) error {
 		return cliError{code: 1, msg: "ssh preparation failed"}
 	}
 	return syscallExec("ssh", sshCmd)
+}
+
+func runSSHReconnect(host, identityFile string, sshArgs []string) error {
+	for attempt := 1; ; attempt++ {
+		if attempt > 1 {
+			time.Sleep(2 * time.Second)
+		}
+		progress := newProgressReporter("text")
+		progress.Step("checking OCI auth...")
+		auth := ensureOCIAuth(progress, true)
+		if !auth.OK {
+			progress.Done()
+			out := authFailurePayload(host, "ssh reconnect preparation failed", auth)
+			out["ssh_command"] = append([]string{"ssh", host}, sshArgs...)
+			if err := emit(out); err != nil {
+				return err
+			}
+			return cliError{code: 1, msg: "OCI auth not ready"}
+		}
+		ensureArgs := bastionEnsureArgs(host, identityFile, "")
+		progress.Step("ensuring Bastion session for %s...", host)
+		ensured := runJSON("bastion-session", ensureArgs...)
+		progress.Done()
+		if !ensured.OK {
+			out := map[string]any{
+				"ok":          false,
+				"host":        host,
+				"auth":        auth,
+				"ensure":      ensured,
+				"ssh_command": append([]string{"ssh", host}, sshArgs...),
+				"reconnect":   true,
+				"issue":       firstIssue("ssh reconnect preparation failed", nextForHost(commandName()+" repair --ensure", host), auth, ensured),
+			}
+			if err := emit(out); err != nil {
+				return err
+			}
+			return cliError{code: 1, msg: "ssh reconnect preparation failed"}
+		}
+		if attempt > 1 {
+			fmt.Fprintf(os.Stderr, "reconnecting to %s after SSH transport disconnect...\n", host)
+		}
+		exitCode, err := runSSHChild(append([]string{"ssh", host}, sshArgs...))
+		if err != nil {
+			return err
+		}
+		if exitCode == 255 {
+			continue
+		}
+		if exitCode != 0 {
+			return cliError{code: exitCode, msg: fmt.Sprintf("ssh exited with status %d", exitCode)}
+		}
+		return nil
+	}
 }
 
 func cmdExplain(args []string) error {
@@ -1684,36 +1741,38 @@ func parseTrackArgs(args []string) (host, terraformOutputs string, passthrough [
 	return host, terraformOutputs, passthrough, nil
 }
 
-func parseSSHArgs(args []string) (host, identityFile string, dryRun bool, sshArgs []string, err error) {
+func parseSSHArgs(args []string) (host, identityFile string, dryRun, reconnect bool, sshArgs []string, err error) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--":
 			sshArgs = append(sshArgs, args[i+1:]...)
-			return requireHost(host, identityFile, dryRun, sshArgs)
+			return requireSSHHost(host, identityFile, dryRun, reconnect, sshArgs)
 		case "--dry-run":
 			dryRun = true
+		case "--reconnect":
+			reconnect = true
 		case "--identity-file":
 			if i+1 >= len(args) {
-				return "", "", false, nil, cliError{code: 2, msg: "--identity-file requires a value"}
+				return "", "", false, false, nil, cliError{code: 2, msg: "--identity-file requires a value"}
 			}
 			identityFile = args[i+1]
 			i++
 		default:
 			if host != "" {
 				sshArgs = append(sshArgs, args[i:]...)
-				return requireHost(host, identityFile, dryRun, sshArgs)
+				return requireSSHHost(host, identityFile, dryRun, reconnect, sshArgs)
 			}
 			host = args[i]
 		}
 	}
-	return requireHost(host, identityFile, dryRun, sshArgs)
+	return requireSSHHost(host, identityFile, dryRun, reconnect, sshArgs)
 }
 
-func requireHost(host, identityFile string, dryRun bool, sshArgs []string) (string, string, bool, []string, error) {
+func requireSSHHost(host, identityFile string, dryRun, reconnect bool, sshArgs []string) (string, string, bool, bool, []string, error) {
 	if strings.TrimSpace(host) == "" {
-		return "", "", false, nil, cliError{code: 2, msg: "host is required"}
+		return "", "", false, false, nil, cliError{code: 2, msg: "host is required"}
 	}
-	return host, identityFile, dryRun, sshArgs, nil
+	return host, identityFile, dryRun, reconnect, sshArgs, nil
 }
 
 func connectCommandFrom(host string, result commandResult) string {
@@ -1880,4 +1939,24 @@ func syscallExec(name string, argv []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func runSSHChild(argv []string) (int, error) {
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), nil
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return 127, execErr
+	}
+	return 1, err
 }

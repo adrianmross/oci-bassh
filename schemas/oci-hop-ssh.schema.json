@@ -9,6 +9,7 @@
     "issue": {"type": "object"},
     "auth": {"$ref": "oci-hop-command-result.schema.json"},
     "ensure": {"$ref": "oci-hop-command-result.schema.json"},
-    "ssh_command": {"type": "array", "items": {"type": "string"}}
+    "ssh_command": {"type": "array", "items": {"type": "string"}},
+    "reconnect": {"type": "boolean"}
   }
 }
