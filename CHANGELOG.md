@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.8.0
+
+- Add `hop ssh --reconnect <host> -- <ssh args...>` to reconnect after SSH
+  transport disconnects while preserving remote commands such as tmux attach.
+- Request 3-hour Bastion sessions by default to match the common OCI Bastion
+  maximum instead of requesting 24 hours and relying on OCI to cap it.
+
 ## v0.7.1
 
 - Request 24-hour Bastion sessions when preparing host SSH routes while still
