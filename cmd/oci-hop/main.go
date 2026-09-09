@@ -186,6 +186,7 @@ func newRootCommand(stdout, stderr io.Writer) *cobra.Command {
 		newInspectCommand(),
 		newRepairCommand(),
 		newEnsureCommand("ensure", &rootWaitTimeout),
+		newForwardCommand(&rootWaitTimeout),
 		newEnsureCommand("ensure-target", &rootWaitTimeout),
 		newTrackCommand("track"),
 		newTrackCommand("track-from-terraform"),
